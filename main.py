@@ -52,8 +52,8 @@ HTML_PAGE = """
             }
 
             btn.disabled = true;
-            btn.innerText = 'Processing tracks... (This may take a minute)';
-            status.innerText = 'Extracting playlist data...';
+            btn.innerText = 'Processing...';
+            status.innerText = 'Fetching tracks and converting audio...';
 
             try {
                 const response = await fetch('/convert', {
@@ -68,13 +68,14 @@ HTML_PAGE = """
                     status.innerText = 'Success! Downloading your ZIP file...';
                     window.location.href = `/download/${data.download_token}`;
                     btn.innerText = 'Done!';
+                    setTimeout(() => { btn.disabled = false; btn.innerText = 'Convert & Download ZIP'; }, 3000);
                 } else {
                     status.innerText = 'Error: ' + (data.error || 'Something went wrong');
                     btn.disabled = false;
                     btn.innerText = 'Convert & Download ZIP';
                 }
             } catch (err) {
-                status.innerText = 'Network error occurred.';
+                status.innerText = 'Network error or timeout occurred.';
                 btn.disabled = false;
                 btn.innerText = 'Convert & Download ZIP';
             }
@@ -90,7 +91,6 @@ def index():
 
 def extract_tracks_from_json(data):
     tracks = []
-    # Recursively search the JSON tree for track objects containing name and artists
     if isinstance(data, dict):
         if data.get("__typename") == "Track" or ("track" in data and isinstance(data["track"], dict)):
             track_obj = data.get("track", data)
@@ -124,8 +124,6 @@ def convert_playlist():
         resp = requests.get(playlist_url, headers=headers)
         
         track_queries = []
-        
-        # Parse Spotify's __NEXT_DATA__ application script block
         script_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>', resp.text, re.DOTALL)
         if script_match:
             try:
@@ -134,17 +132,17 @@ def convert_playlist():
             except Exception:
                 pass
 
-        # Fallback regex search if JSON parsing yields nothing
         if not track_queries:
             song_matches = re.findall(r'"name"\s*:\s*"([^"]+)"', resp.text)
             if song_matches:
-                track_queries = song_matches[:25]
+                track_queries = song_matches[:5]
 
         if not track_queries:
             return jsonify({"error": "Could not read tracks. Ensure the playlist is public."}), 400
 
         downloaded_count = 0
-        for query in track_queries[:20]:  # Limit to 20 tracks for optimal server performance
+        # Limit to the first 5 tracks to complete well under the 30-second server timeout limit
+        for query in track_queries[:5]:
             try:
                 search_results = ytmusic.search(query, filter="songs", limit=1)
                 if search_results:
@@ -157,9 +155,10 @@ def convert_playlist():
                         'postprocessors': [{
                             'key': 'FFmpegExtractAudio',
                             'preferredcodec': 'mp3',
-                            'preferredquality': '192',
+                            'preferredquality': '128',
                         }],
-                        'quiet': True
+                        'quiet': True,
+                        'socket_timeout': 5
                     }
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         ydl.download([video_url])
