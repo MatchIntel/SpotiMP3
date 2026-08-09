@@ -2,6 +2,7 @@ import os
 import shutil
 import uuid
 import tempfile
+import re
 import requests
 from flask import Flask, render_template_string, request, send_file, jsonify
 import yt_dlp
@@ -49,7 +50,7 @@ HTML_PAGE = """
 
             btn.disabled = true;
             btn.innerText = 'Processing tracks... (This may take a minute)';
-            status.innerText = 'Extracting metadata & fetching audio sources...';
+            status.innerText = 'Extracting track list from Spotify...';
 
             try {
                 const response = await fetch('/convert', {
@@ -84,28 +85,6 @@ HTML_PAGE = """
 def index():
     return render_template_string(HTML_PAGE)
 
-def get_spotify_playlist_tracks(playlist_url):
-    try:
-        # Extract playlist ID from URL
-        playlist_id = playlist_url.split("?")[0].split("/")[-1]
-        
-        # Use Spotify's embed API endpoint to bypass heavy auth requirements safely
-        embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(embed_url, headers=headers)
-        
-        # Fallback extraction: parse oEmbed or use alternative public info scraping
-        # Better approach for lightweight public API tracking:
-        api_url = f"https://open.spotify.com/oembed?url={playlist_url}"
-        oembed_resp = requests.get(api_url).json()
-        playlist_title = oembed_resp.get("title", "Playlist")
-
-        # As an alternative robust fallback if direct scraping is limited, 
-        # we can extract tracks using public web endpoints or fallback to yt-dlp playlist parsing directly from the playlist URL!
-        return playlist_title
-    except Exception as e:
-        return None
-
 @app.route("/convert", methods=["POST"])
 def convert_playlist():
     data = request.get_json()
@@ -119,7 +98,44 @@ def convert_playlist():
     os.makedirs(session_dir, exist_ok=True)
 
     try:
-        # yt-dlp natively supports parsing Spotify playlist/track URLs directly and downloading matching audio!
+        # Scrape public meta tags from the Spotify playlist page to get song titles & artists
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        resp = requests.get(playlist_url, headers=headers)
+        
+        # Extract track/artist names using OpenGraph meta descriptions or HTML title tags
+        matches = re.findall(r'<meta property="og:title" content="([^"]+)"', resp.text)
+        
+        if not matches:
+            return jsonify({"error": "Could not read playlist metadata from Spotify link."}), 400
+
+        playlist_name = matches[0]
+        
+        # If it's a single track or general page, grab description tags which often list songs
+        desc_matches = re.findall(r'<meta name="description" content="([^"]+)"', resp.text)
+        track_queries = []
+        
+        if desc_matches:
+            description = desc_matches[0]
+            # Spotify meta descriptions usually list songs like: "Song 1 · Song 2 · Song 3..."
+            raw_tracks = description.replace(" · ", ",").split(",")
+            for t in raw_tracks:
+                clean_t = t.strip()
+                if clean_t and "·" not in clean_t and "Listen to" not in clean_t:
+                    track_queries.append(clean_t)
+
+        # Fallback: if description parsing fails, extract song names via alternative page tokens
+        if not track_queries:
+            # Look for structured track entries in the HTML body
+            song_matches = re.findall(r'"track"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"', resp.text)
+            artist_matches = re.findall(r'"artists"\s*:\s*\[\{[^}]*"name"\s*:\s*"([^"]+)"', resp.text)
+            if song_matches:
+                for i in range(min(len(song_matches), len(artist_matches))):
+                    track_queries.append(f"{artist_matches[i]} - {song_matches[i]}")
+
+        if not track_queries:
+            return jsonify({"error": "Could not parse individual tracks from this playlist format. Make sure it's a public playlist."}), 400
+
+        # Download each track via yt-dlp search query
         ydl_opts = {
             'format': 'bestaudio/best',
             'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
@@ -128,15 +144,19 @@ def convert_playlist():
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
             }],
-            'noplaylist': False,
+            'noplaylist': True,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([playlist_url])
+            for query in track_queries[:25]: # Limit to first 25 tracks for speed/reliability
+                try:
+                    ydl.download([f"ytsearch:{query} audio"])
+                except Exception:
+                    continue
 
         mp3_files = [f for f in os.listdir(session_dir) if f.endswith(".mp3")]
         if not mp3_files:
-            return jsonify({"error": "No tracks could be resolved from this link."}), 404
+            return jsonify({"error": "No matching audio tracks could be downloaded."}), 404
 
         zip_base_path = os.path.join(tempfile.gettempdir(), session_id)
         shutil.make_archive(zip_base_path, 'zip', session_dir)
