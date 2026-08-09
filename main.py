@@ -53,7 +53,7 @@ HTML_PAGE = """
 
             btn.disabled = true;
             btn.innerText = 'Processing...';
-            status.innerText = 'Fetching tracks and converting audio...';
+            status.innerText = 'Bypassing restrictions & downloading...';
 
             try {
                 const response = await fetch('/convert', {
@@ -141,7 +141,6 @@ def convert_playlist():
             return jsonify({"error": "Could not read tracks. Ensure the playlist is public."}), 400
 
         downloaded_count = 0
-        # Limit to the first 5 tracks to complete well under the 30-second server timeout limit
         for query in track_queries[:5]:
             try:
                 search_results = ytmusic.search(query, filter="songs", limit=1)
@@ -157,8 +156,13 @@ def convert_playlist():
                             'preferredcodec': 'mp3',
                             'preferredquality': '128',
                         }],
+                        'extractor_args': {
+                            'youtube': {
+                                'player_client': ['android', 'web']
+                            }
+                        },
                         'quiet': True,
-                        'socket_timeout': 5
+                        'socket_timeout': 10
                     }
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         ydl.download([video_url])
