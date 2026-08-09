@@ -1,3 +1,5 @@
 Flask
 gunicorn
-spotdl
+ytmusicapi
+yt-dlp
+requests
