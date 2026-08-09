@@ -2,6 +2,7 @@ import os
 import shutil
 import uuid
 import tempfile
+import json
 import re
 import requests
 from flask import Flask, render_template_string, request, send_file, jsonify
@@ -52,7 +53,7 @@ HTML_PAGE = """
 
             btn.disabled = true;
             btn.innerText = 'Processing tracks... (This may take a minute)';
-            status.innerText = 'Extracting playlist tracks...';
+            status.innerText = 'Extracting playlist data...';
 
             try {
                 const response = await fetch('/convert', {
@@ -87,6 +88,25 @@ HTML_PAGE = """
 def index():
     return render_template_string(HTML_PAGE)
 
+def extract_tracks_from_json(data):
+    tracks = []
+    # Recursively search the JSON tree for track objects containing name and artists
+    if isinstance(data, dict):
+        if data.get("__typename") == "Track" or ("track" in data and isinstance(data["track"], dict)):
+            track_obj = data.get("track", data)
+            name = track_obj.get("name")
+            artists = track_obj.get("artists")
+            if name and artists:
+                artist_names = ", ".join([a.get("name", "") for a in artists if isinstance(a, dict)])
+                if artist_names:
+                    tracks.append(f"{artist_names} - {name}")
+        for k, v in data.items():
+            tracks.extend(extract_tracks_from_json(v))
+    elif isinstance(data, list):
+        for item in data:
+            tracks.extend(extract_tracks_from_json(item))
+    return tracks
+
 @app.route("/convert", methods=["POST"])
 def convert_playlist():
     data = request.get_json()
@@ -103,31 +123,28 @@ def convert_playlist():
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         resp = requests.get(playlist_url, headers=headers)
         
-        # Extract song names and artists from the Spotify playlist page data
-        song_matches = re.findall(r'"track"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"', resp.text)
-        artist_matches = re.findall(r'"artists"\s*:\s*\[\{[^}]*"name"\s*:\s*"([^"]+)"', resp.text)
-        
         track_queries = []
-        if song_matches and artist_matches:
-            for i in range(min(len(song_matches), len(artist_matches))):
-                track_queries.append(f"{artist_matches[i]} - {song_matches[i]}")
         
-        # Fallback parsing via description tags if JSON matching is empty
+        # Parse Spotify's __NEXT_DATA__ application script block
+        script_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>', resp.text, re.DOTALL)
+        if script_match:
+            try:
+                json_data = json.loads(script_match.group(1))
+                track_queries = list(set(extract_tracks_from_json(json_data)))
+            except Exception:
+                pass
+
+        # Fallback regex search if JSON parsing yields nothing
         if not track_queries:
-            desc_matches = re.findall(r'<meta name="description" content="([^"]+)"', resp.text)
-            if desc_matches:
-                parts = desc_matches[0].replace(" · ", ",").split(",")
-                for p in parts:
-                    clean = p.strip()
-                    if clean and "·" not in clean and "Listen to" not in clean:
-                        track_queries.append(clean)
+            song_matches = re.findall(r'"name"\s*:\s*"([^"]+)"', resp.text)
+            if song_matches:
+                track_queries = song_matches[:25]
 
         if not track_queries:
-            return jsonify({"error": "Could not extract tracks. Make sure the playlist is public."}), 400
+            return jsonify({"error": "Could not read tracks. Ensure the playlist is public."}), 400
 
-        # Query YouTube Music via ytmusicapi and download the audio with yt-dlp
         downloaded_count = 0
-        for query in track_queries[:25]: # Limit to first 25 tracks for speed
+        for query in track_queries[:20]:  # Limit to 20 tracks for optimal server performance
             try:
                 search_results = ytmusic.search(query, filter="songs", limit=1)
                 if search_results:
